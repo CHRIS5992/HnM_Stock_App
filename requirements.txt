@@ -1,0 +1,22 @@
+# requirements.txt
+# Python dependencies for the stock prediction app
+
+# Data handling
+pandas
+numpy
+yfinance
+
+# Machine Learning
+scikit-learn
+xgboost
+joblib
+
+# Visualization
+matplotlib
+plotly
+
+# Web App
+streamlit
+
+# Technical indicators
+ta
