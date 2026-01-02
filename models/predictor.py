@@ -6,6 +6,8 @@ import numpy as np
 import joblib
 from pathlib import Path
 from xgboost import XGBRegressor
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from typing import Union
 
@@ -68,6 +70,7 @@ def train_model(
     df: pd.DataFrame,
     feature_cols: list[str] = None,
     target_col: str = 'Close',
+    horizon_days: int = 1,
     test_size: float = 0.2,
     save_path: str = None
 ) -> tuple[XGBRegressor, dict]:
@@ -86,8 +89,20 @@ def train_model(
     """
     if feature_cols is None:
         feature_cols = DEFAULT_FEATURE_COLS
-    
-    X, y = prepare_data(df, feature_cols, target_col)
+    # Build target as log return over horizon_days and normalize by rolling vol
+    df_local = df.copy()
+    # log return for horizon
+    df_local['target_return'] = np.log(df_local['Close'].shift(-horizon_days) / df_local['Close'])
+    # rolling vol based on daily log returns
+    daily_logret = np.log(df_local['Close'] / df_local['Close'].shift(1))
+    df_local['vol'] = daily_logret.rolling(window=20, min_periods=5).std().fillna(method='bfill').replace(0, 1e-6)
+
+    # Drop rows with NaN targets (last horizon days)
+    df_local = df_local.iloc[:-horizon_days].reset_index(drop=True)
+
+    # Prepare features and normalized target
+    X = df_local[feature_cols].values
+    y = (df_local['target_return'].values) / df_local['vol'].values
     
     # Time-series split (don't shuffle - preserve order)
     split_idx = int(len(X) * (1 - test_size))
@@ -96,24 +111,24 @@ def train_model(
     
     # Train XGBoost
     model = XGBRegressor(
-        n_estimators=100,
-        max_depth=5,
+        n_estimators=80,
+        max_depth=4,
         learning_rate=0.1,
         random_state=42,
-        n_jobs=-1
+        n_jobs=-1,
+        tree_method='hist'
     )
     model.fit(X_train, y_train)
     
     # Evaluate
     y_pred = model.predict(X_test)
     metrics = {
-        'mae': mean_absolute_error(y_test, y_pred),
-        'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
-        'mape': np.mean(np.abs((y_test - y_pred) / y_test)) * 100
+        'mae': mean_absolute_error(y_test, y_pred)
     }
     
     # Save model if path provided
     if save_path:
+        # Save the model that predicts normalized returns
         save_model(model, save_path)
     
     return model, metrics
@@ -124,75 +139,97 @@ def train_multi_horizon_models(
     feature_cols: list[str] = None,
     horizons: dict[str, int] = None,
     test_size: float = 0.2,
-    save_path: str = None
-) -> tuple[dict[str, XGBRegressor], dict[str, dict]]:
+    save_path: str = None,
+    weights: dict = None
+) -> tuple[dict[str, dict], dict[str, dict]]:
     """
-    Train separate XGBoost models for each prediction horizon.
-    Optimized for speed with lightweight models.
-    
-    Args:
-        df: DataFrame with features (from create_features)
-        feature_cols: List of feature column names
-        horizons: Dict mapping horizon name to days ahead
-        test_size: Fraction for test split
-        save_path: Base path to save models (optional, adds _1d, _5d, etc.)
-        
-    Returns:
-        Tuple of (models dict, metrics dict) keyed by horizon name
+    Train a fast ensemble (GradientBoostingRegressor + Ridge) per horizon.
+
+    Walk-forward split: last `test_size` fraction is validation (no shuffling).
+    Models are trained once per horizon and final predictions are a weighted
+    average of GBM and Ridge (default weights: 0.6, 0.4).
+
+    Returns a dict of per-horizon ensembles and a dict of metrics (MAE reported).
     """
     if feature_cols is None:
         feature_cols = DEFAULT_FEATURE_COLS
     if horizons is None:
         horizons = HORIZONS
-    
-    # Create target columns for all horizons
-    df_targets = create_horizon_targets(df, horizons)
-    
+    if weights is None:
+        weights = {'gbm': 0.6, 'ridge': 0.4}
+
+    # We'll compute log-return targets and normalize by rolling volatility
+    df_local = df.copy()
+    # daily log return and rolling vol
+    daily_logret = np.log(df_local['Close'] / df_local['Close'].shift(1))
+    df_local['vol'] = daily_logret.rolling(window=20, min_periods=5).std().fillna(method='bfill').replace(0, 1e-6)
+
+    # Build horizon targets (log returns) and drop last rows
+    max_horizon = max(horizons.values())
+    for name, days in horizons.items():
+        df_local[f'target_{name}'] = np.log(df_local['Close'].shift(-days) / df_local['Close'])
+    df_targets = df_local.iloc[:-max_horizon].reset_index(drop=True)
+
     # Pre-compute features once for speed
     X = df_targets[feature_cols].values
     split_idx = int(len(X) * (1 - test_size))
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    
-    models = {}
+    X_train, X_val = X[:split_idx], X[split_idx:]
+
+    ensembles = {}
     all_metrics = {}
-    
+
     for horizon_name in horizons.keys():
         target_col = f'target_{horizon_name}'
-        y = df_targets[target_col].values
-        y_train, y_test = y[:split_idx], y[split_idx:]
-        
-        # Train lightweight XGBoost optimized for single-stock speed
-        model = XGBRegressor(
+        # raw log-return target
+        y_raw = df_targets[target_col].values
+        vol = df_targets['vol'].values
+        # normalized target (safe divide)
+        y_norm = y_raw / (vol + 1e-12)
+        y_train, y_val = y_norm[:split_idx], y_norm[split_idx:]
+
+        # Fast Gradient Boosting (shallow, small trees) predicting normalized returns
+        gbm = GradientBoostingRegressor(
             n_estimators=80,
-            max_depth=4,
+            max_depth=3,
             learning_rate=0.1,
-            random_state=42,
-            n_jobs=-1,
-            tree_method='hist'  # Faster training
+            subsample=0.8,
+            random_state=42
         )
-        model.fit(X_train, y_train)
-        
-        # Evaluate
-        y_pred = model.predict(X_test)
-        metrics = {
-            'mae': mean_absolute_error(y_test, y_pred),
-            'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
-            'mape': np.mean(np.abs((y_test - y_pred) / y_test)) * 100
+
+        ridge = Ridge(alpha=1.0)
+
+        # Train both models (fast)
+        gbm.fit(X_train, y_train)
+        ridge.fit(X_train, y_train)
+
+        # Validation predictions (normalized) and weighted average
+        pred_gbm = gbm.predict(X_val)
+        pred_ridge = ridge.predict(X_val)
+        pred_ensemble = (weights['gbm'] * pred_gbm) + (weights['ridge'] * pred_ridge)
+
+        mae = mean_absolute_error(y_val, pred_ensemble)
+
+        ensembles[horizon_name] = {
+            'gbm': gbm,
+            'ridge': ridge,
+            'weights': weights.copy()
         }
-        
-        models[horizon_name] = model
-        all_metrics[horizon_name] = metrics
-    
-    # Save models if path provided
+
+        all_metrics[horizon_name] = {
+            'mae': mae
+        }
+
+    # Save models and weights if path provided
     if save_path:
-        save_multi_horizon_models(models, save_path)
-    
-    return models, all_metrics
+        # Save ensembles (contain models and weights)
+        save_multi_horizon_models(ensembles, save_path)
+
+    return ensembles, all_metrics
 
 
 def predict_multi_horizon(
     df: pd.DataFrame,
-    models: dict[str, XGBRegressor],
+    models: dict,
     feature_cols: list[str] = None
 ) -> dict[str, float]:
     """
@@ -211,13 +248,48 @@ def predict_multi_horizon(
         feature_cols = DEFAULT_FEATURE_COLS
     
     # Get latest features once
+    if feature_cols is None:
+        feature_cols = DEFAULT_FEATURE_COLS
+
+    # Latest features and last close
     X = df[feature_cols].iloc[-1:].values
-    
+    last_close = float(df['Close'].iloc[-1])
+
+    # Recent volatility (rolling of daily log returns)
+    daily_logret = np.log(df['Close'] / df['Close'].shift(1))
+    recent_vol = daily_logret.tail(20).std()
+    recent_vol = float(recent_vol) if not np.isnan(recent_vol) and recent_vol > 0 else 1e-6
+
+    # Trend anchoring: use MA slope (ma_5 vs ma_20)
+    ma5 = df.get('ma_5') if 'ma_5' in df.columns else None
+    ma20 = df.get('ma_20') if 'ma_20' in df.columns else None
+    bullish = False
+    if ma5 is not None and ma20 is not None and len(df) >= 6:
+        slope = ma5.iloc[-1] - ma5.iloc[-5] if len(ma5) >= 5 else ma5.iloc[-1] - ma5.iloc[0]
+        bullish = (ma5.iloc[-1] > ma20.iloc[-1]) and (slope > 0)
+
     predictions = {}
-    for horizon_name, model in models.items():
-        pred = model.predict(X)[0]
-        predictions[horizon_name] = round(float(pred), 2)
-    
+    for horizon_name, mdl in models.items():
+        # Predict normalized log-return
+        if isinstance(mdl, dict) and 'gbm' in mdl and 'ridge' in mdl:
+            pred_gbm_norm = mdl['gbm'].predict(X)[0]
+            pred_ridge_norm = mdl['ridge'].predict(X)[0]
+            w = mdl.get('weights', {'gbm': 0.6, 'ridge': 0.4})
+            pred_norm = (w.get('gbm', 0.6) * pred_gbm_norm) + (w.get('ridge', 0.4) * pred_ridge_norm)
+        else:
+            pred_norm = mdl.predict(X)[0]
+
+        # De-normalize to log-return
+        pred_logret = float(pred_norm) * recent_vol
+
+        # Trend anchoring: in bullish trend reduce negative bias
+        if bullish and pred_logret < 0:
+            pred_logret = pred_logret * 0.5 + 0.25 * recent_vol
+
+        # Reconstruct price from last close (log-return)
+        pred_price = last_close * float(np.exp(pred_logret))
+        predictions[horizon_name] = round(float(pred_price), 2)
+
     return predictions
 
 
@@ -516,34 +588,54 @@ def predict_future(
     df = df.copy()
     predictions = []
     last_date = pd.to_datetime(df['Date'].iloc[-1])
-    
+    # recent volatility and last close for de-normalization
+    daily_logret = np.log(df['Close'] / df['Close'].shift(1))
+    recent_vol = daily_logret.tail(20).std()
+    recent_vol = float(recent_vol) if not np.isnan(recent_vol) and recent_vol > 0 else 1e-6
+
     for i in range(days):
         # Get latest features
         X = df[feature_cols].iloc[-1:].values
-        
-        # Predict next close
-        next_close = model.predict(X)[0]
+
+        # Support ensemble dicts or single models predicting normalized log-return
+        if isinstance(model, dict) and 'gbm' in model and 'ridge' in model:
+            pg = model['gbm'].predict(X)[0]
+            pr = model['ridge'].predict(X)[0]
+            w = model.get('weights', {'gbm': 0.6, 'ridge': 0.4})
+            pred_norm = w.get('gbm', 0.6) * pg + w.get('ridge', 0.4) * pr
+        else:
+            pred_norm = model.predict(X)[0]
+
+        # De-normalize to log-return and compute next close
+        pred_logret = float(pred_norm) * recent_vol
+        prev_close = float(df['Close'].iloc[-1])
+        next_close = prev_close * float(np.exp(pred_logret))
+
         next_date = last_date + pd.Timedelta(days=1)
-        
+
         # Skip weekends
         while next_date.weekday() >= 5:
             next_date += pd.Timedelta(days=1)
-        
+
         predictions.append({
             'Date': next_date,
             'Predicted_Close': round(next_close, 2)
         })
-        
+
         # Update features for next prediction (rolling update)
         new_row = df.iloc[-1:].copy()
         new_row['Date'] = next_date
-        prev_close = df['Close'].iloc[-1]
         new_row['Close'] = next_close
-        new_row['returns'] = (next_close - prev_close) / prev_close
-        new_row['ma_5'] = np.mean(df['Close'].iloc[-4:].tolist() + [next_close])
-        new_row['ma_10'] = np.mean(df['Close'].iloc[-9:].tolist() + [next_close])
-        new_row['ma_20'] = np.mean(df['Close'].iloc[-19:].tolist() + [next_close])
-        
+        # recompute simple derived features
+        new_row['returns'] = np.log(next_close / prev_close)
+        # Rolling means: take recent closes
+        closes = df['Close'].tolist()
+        closes.append(next_close)
+        new_row['ma_5'] = np.mean(closes[-5:]) if len(closes) >= 5 else np.mean(closes)
+        new_row['ma_10'] = np.mean(closes[-10:]) if len(closes) >= 10 else np.mean(closes)
+        new_row['ma_20'] = np.mean(closes[-20:]) if len(closes) >= 20 else np.mean(closes)
+
+        # new_row is already a one-row DataFrame slice; concat directly
         df = pd.concat([df, new_row], ignore_index=True)
         last_date = next_date
     
@@ -631,7 +723,7 @@ if __name__ == "__main__":
             save_path="reliance_model.joblib"
         )
         for horizon, m in all_metrics.items():
-            print(f"{horizon}: MAE={m['mae']:.2f}, RMSE={m['rmse']:.2f}, MAPE={m['mape']:.2f}%")
+            print(f"{horizon}: MAE={m['mae']:.4f}")
         
         # Predict multi-horizon (fast, direct prediction)
         print("\n=== Multi-Horizon Predictions ===")
