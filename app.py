@@ -6,6 +6,9 @@ import plotly.graph_objects as go
 import pandas as pd
 from pathlib import Path
 import sys
+import concurrent.futures
+import queue
+import time
 
 # Add project root to path
 ROOT_DIR = Path(__file__).parent
@@ -27,6 +30,7 @@ from models.predictor import (
     save_multi_horizon_models, save_quantile_models,
     predict_with_regime_adjustment, get_regime_explanation
 )
+from train import train_with_progress, get_last_trained_timestamp
 
 # Page config - must be first Streamlit command
 st.set_page_config(
@@ -444,21 +448,26 @@ def main():
         
         available_models = get_available_models()
         
+        # Training safety: retrain threshold (hours)
+        retrain_threshold = st.number_input("Retrain threshold (hours)", min_value=1, value=24)
+
         # Stock selection with search
         default_idx = symbols.index("RELIANCE") if "RELIANCE" in symbols else 0
+        training_now = st.session_state.get('training', False)
         selected_symbol = st.selectbox(
             "Select Stock",
             options=symbols,
             index=default_idx,
-            help="Type to search"
+            help="Type to search",
+            disabled=training_now
         )
         
         # Date range
         col1, col2 = st.columns(2)
         with col1:
-            start_date = st.date_input("Start", value=pd.to_datetime("2023-01-01"))
+            start_date = st.date_input("Start", value=pd.to_datetime("2023-01-01"), disabled=training_now)
         with col2:
-            end_date = st.date_input("End", value=pd.to_datetime("2024-12-31"))
+            end_date = st.date_input("End", value=pd.to_datetime("2024-12-31"), disabled=training_now)
         
         # Validate dates
         if start_date >= end_date:
@@ -466,7 +475,7 @@ def main():
             st.stop()
         
         # Prediction days
-        pred_days = st.slider("Prediction Days", 1, 30, 5)
+        pred_days = st.slider("Prediction Days", 1, 30, 5, disabled=training_now)
         
         # Model status & training
         st.markdown("---")
@@ -478,11 +487,17 @@ def main():
         else:
             st.info(f"No model for {selected_symbol}")
         
+        # Last trained timestamp
+        last_trained = get_last_trained_timestamp(selected_symbol)
+        if last_trained:
+            st.caption(f"Last trained: {last_trained.isoformat()} UTC")
+
         # Train button
         train_btn = st.button(
             "🚀 Train Model" if not model_exists else "🔄 Retrain Model",
             use_container_width=True,
-            type="primary" if not model_exists else "secondary"
+            type="primary" if not model_exists else "secondary",
+            disabled=training_now
         )
     
     # Main content
@@ -502,23 +517,84 @@ def main():
     if len(df) < 25:
         st.warning(f"⚠️ Only {len(df)} data points. Consider expanding date range.")
     
-    # Handle training
+    # Handle training with progress (non-blocking background thread)
     if train_btn:
-        with st.spinner(f"🔄 Training model for {selected_symbol}..."):
-            success, message, metrics = train_stock_model(selected_symbol, df)
-        
-        if success:
-            st.success(f"✅ {message}")
-            st.markdown("**Training Metrics:**")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("MAE", f"₹{metrics['mae']:.2f}")
-            col2.metric("RMSE", f"₹{metrics['rmse']:.2f}")
-            col3.metric("MAPE", f"{metrics['mape']:.2f}%")
-            # Update model status
-            model_exists = True
-            st.rerun()
-        else:
-            st.error(f"❌ {message}")
+        # Prevent double clicks
+        st.session_state['training'] = True
+
+        q = queue.Queue()
+
+        def progress_cb(stage: str, pct: int):
+            q.put({'stage': stage, 'pct': int(pct)})
+
+        # Start background training
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            train_with_progress,
+            f"{selected_symbol}.NS",
+            str(start_date),
+            str(end_date),
+            progress_cb,
+            retrain_threshold
+        )
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        try:
+            # Poll for progress until done
+            while not future.done():
+                try:
+                    while not q.empty():
+                        msg = q.get_nowait()
+                        pct = msg.get('pct', 0)
+                        stage = msg.get('stage', '')
+                        status_text.info(f"{stage} — {pct}%")
+                        progress_bar.progress(pct)
+                except queue.Empty:
+                    pass
+                time.sleep(0.1)
+
+            # Drain any remaining messages
+            try:
+                while not q.empty():
+                    msg = q.get_nowait()
+                    pct = msg.get('pct', 0)
+                    stage = msg.get('stage', '')
+                    status_text.info(f"{stage} — {pct}%")
+                    progress_bar.progress(pct)
+            except queue.Empty:
+                pass
+
+            success, message, metrics = future.result()
+
+            # Ensure progress bar completes
+            progress_bar.progress(100)
+            status_text.empty()
+
+            if success:
+                st.success(f"✅ {message}")
+                if metrics:
+                    st.markdown("**Training Metrics:**")
+                    col1, col2, col3 = st.columns(3)
+                    if 'mae' in metrics:
+                        col1.metric("MAE", f"₹{metrics['mae']:.2f}")
+                # Clear caches so new models load
+                cached_load_model.clear()
+                cached_load_multi_horizon_models.clear()
+                cached_load_quantile_models.clear()
+                # Update model status
+                model_exists = True
+                # Update last trained display
+                last_trained = get_last_trained_timestamp(selected_symbol)
+            else:
+                st.error(f"❌ {message}")
+
+        except Exception as e:
+            st.error(f"Training failed: {str(e)}")
+        finally:
+            st.session_state['training'] = False
+            executor.shutdown(wait=False)
     
     # Analytics section
     analytics = calculate_analytics(df)
