@@ -1,5 +1,6 @@
 # app.py
 # Streamlit app for stock price prediction (optimized)
+# Now includes Macrostructure and Microstructure Discovery
 
 import streamlit as st
 import plotly.graph_objects as go
@@ -14,13 +15,28 @@ import time
 ROOT_DIR = Path(__file__).parent
 sys.path.insert(0, str(ROOT_DIR))
 
-from utils.data_loader import get_nse_symbols, fetch_stock_data
+from utils.data_loader import get_nse_symbols, fetch_stock_data, fetch_intraday_data
 from utils.features import create_features, get_feature_columns
 from utils.regime import detect_regime, get_regime_details
 from utils.analytics import get_technical_summary, generate_rationale, get_prediction_explanation
 from utils.backtest import (
     rolling_backtest, multi_horizon_backtest, 
     generate_backtest_df, get_backtest_summary, compare_horizons
+)
+from utils.structure import (
+    analyze_market_structure, get_structure_summary,
+    detect_swing_points, detect_order_blocks, detect_fair_value_gaps
+)
+from utils.microstructure import (
+    calculate_volume_profile, get_volume_profile_df,
+    simulate_order_book, get_depth_chart_data,
+    calculate_order_imbalance, calculate_microstructure_score,
+    analyze_microstructure
+)
+from utils.charts import (
+    create_structure_chart, create_volume_profile_chart,
+    create_depth_chart, create_order_flow_chart,
+    create_microstructure_gauge, INSTITUTIONAL_DARK_THEME
 )
 from models.predictor import (
     load_model, predict_future, train_model, MODELS_DIR,
@@ -643,11 +659,20 @@ def main():
     
     st.markdown("---")
     
-    # Predictions (with caching)
-    predictions = None
-    confidence_preds = None
-    multi_horizon_preds = None
-    regime_adjusted_result = None
+    # ============== MAIN TABS ==============
+    tab_prediction, tab_macro, tab_micro = st.tabs([
+        "📈 Prediction", 
+        "🌍 Macro Discovery", 
+        "🔬 Microstructure"
+    ])
+    
+    # ============== TAB 1: PREDICTION ==============
+    with tab_prediction:
+        # Predictions (with caching)
+        predictions = None
+        confidence_preds = None
+        multi_horizon_preds = None
+        regime_adjusted_result = None
     
     if model_exists:
         with st.spinner("Generating predictions..."):
@@ -928,16 +953,281 @@ def main():
                     )
                     st.plotly_chart(error_fig, use_container_width=True)
     
-    st.markdown("---")
+        st.markdown("---")
+        
+        # Historical data (lazy loaded) - moved inside prediction tab
+        with st.expander("📋 Historical Data (Last 50 rows)"):
+            display_df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].tail(50).copy()
+            display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
+            for col in ['Open', 'High', 'Low', 'Close']:
+                display_df[col] = display_df[col].apply(lambda x: f"₹{x:,.2f}")
+            display_df['Volume'] = display_df['Volume'].apply(lambda x: f"{x:,.0f}")
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
     
-    # Historical data (lazy loaded)
-    with st.expander("📋 Historical Data (Last 50 rows)"):
-        display_df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].tail(50).copy()
-        display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
-        for col in ['Open', 'High', 'Low', 'Close']:
-            display_df[col] = display_df[col].apply(lambda x: f"₹{x:,.2f}")
-        display_df['Volume'] = display_df['Volume'].apply(lambda x: f"{x:,.0f}")
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    # ============== TAB 2: MACROSTRUCTURE DISCOVERY ==============
+    with tab_macro:
+        st.subheader("🌍 Macrostructure Discovery")
+        st.caption("Smart Money Concepts: BOS/CHoCH, Order Blocks, Fair Value Gaps, Liquidity Pools")
+        
+        # Structure Analysis Settings
+        with st.expander("⚙️ Structure Settings", expanded=False):
+            struct_col1, struct_col2, struct_col3 = st.columns(3)
+            with struct_col1:
+                swing_lookback = st.slider("Swing Lookback", 3, 10, 5, help="Candles on each side for swing detection")
+            with struct_col2:
+                displacement_threshold = st.slider("Displacement %", 0.5, 5.0, 1.5, help="Min move % for Order Blocks") / 100
+            with struct_col3:
+                fvg_min_size = st.slider("FVG Min Size %", 0.1, 2.0, 0.1, help="Minimum Fair Value Gap size") / 100
+        
+        # Run Structure Analysis
+        with st.spinner("Analyzing market structure..."):
+            try:
+                structure_analysis = analyze_market_structure(
+                    df,
+                    swing_lookback=swing_lookback,
+                    displacement_threshold=displacement_threshold,
+                    fvg_min_size=fvg_min_size
+                )
+                structure_summary = get_structure_summary(structure_analysis)
+            except Exception as e:
+                st.error(f"Structure analysis failed: {str(e)[:100]}")
+                structure_analysis = None
+                structure_summary = None
+        
+        if structure_analysis:
+            # Structure Summary Metrics
+            summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
+            
+            with summary_col1:
+                bias = structure_summary['bias']
+                bias_icon = "🟢" if bias == 'Bullish' else "🔴" if bias == 'Bearish' else "⚪"
+                st.metric("Structure Bias", f"{bias_icon} {bias}")
+            
+            with summary_col2:
+                st.metric("Order Blocks", structure_summary['key_zones']['order_blocks'])
+            
+            with summary_col3:
+                st.metric("Unfilled FVGs", structure_summary['key_zones']['fair_value_gaps'])
+            
+            with summary_col4:
+                st.metric("Liquidity Pools", structure_summary['key_zones']['liquidity_pools'])
+            
+            # Reversal Warning
+            if structure_summary.get('reversal_warning'):
+                st.warning(f"⚠️ **Reversal Signal**: {structure_summary['reversal_warning']}")
+            
+            st.markdown("---")
+            
+            # Toggle visibility options
+            viz_col1, viz_col2, viz_col3 = st.columns(3)
+            with viz_col1:
+                show_swings = st.checkbox("Show Swings", value=True)
+                show_bos = st.checkbox("Show BOS", value=True)
+            with viz_col2:
+                show_choch = st.checkbox("Show CHoCH", value=True)
+                show_obs = st.checkbox("Show Order Blocks", value=True)
+            with viz_col3:
+                show_fvgs = st.checkbox("Show FVGs", value=True)
+                show_liquidity = st.checkbox("Show Liquidity", value=True)
+            
+            # Structure Chart
+            try:
+                structure_fig = create_structure_chart(
+                    df,
+                    structure_analysis,
+                    show_swings=show_swings,
+                    show_bos=show_bos,
+                    show_choch=show_choch,
+                    show_order_blocks=show_obs,
+                    show_fvgs=show_fvgs,
+                    show_liquidity=show_liquidity
+                )
+                st.plotly_chart(structure_fig, use_container_width=True, config={
+                    'displayModeBar': True,
+                    'scrollZoom': True
+                })
+            except Exception as e:
+                st.error(f"Chart rendering failed: {str(e)[:100]}")
+            
+            st.markdown("---")
+            
+            # Detailed Structure Information
+            detail_col1, detail_col2 = st.columns(2)
+            
+            with detail_col1:
+                st.markdown("**📊 Recent BOS Events**")
+                bos_events = structure_analysis.get('bos_events', [])[-5:]
+                if bos_events:
+                    for bos in reversed(bos_events):
+                        direction_icon = "📈" if bos.direction == 'bullish' else "📉"
+                        st.markdown(f"- {direction_icon} **{bos.break_type}** at ₹{bos.price:.2f} ({bos.date.strftime('%Y-%m-%d')})")
+                else:
+                    st.caption("No recent BOS events detected")
+                
+                st.markdown("**⚡ CHoCH Events (Reversals)**")
+                choch_events = structure_analysis.get('choch_events', [])[-3:]
+                if choch_events:
+                    for choch in reversed(choch_events):
+                        st.markdown(f"- ⚠️ **{choch.direction.title()} Reversal** at ₹{choch.price:.2f}")
+                else:
+                    st.caption("No recent CHoCH events detected")
+            
+            with detail_col2:
+                st.markdown("**🟦 Active Order Blocks**")
+                order_blocks = structure_analysis.get('order_blocks', [])[-5:]
+                if order_blocks:
+                    for ob in reversed(order_blocks):
+                        ob_icon = "🟢" if ob.ob_type == 'bullish' else "🔴"
+                        tested_label = "✅ Tested" if ob.tested else "🆕 Fresh"
+                        st.markdown(f"- {ob_icon} {ob.ob_type.title()} OB: ₹{ob.bottom:.2f} - ₹{ob.top:.2f} ({tested_label})")
+                else:
+                    st.caption("No active Order Blocks detected")
+                
+                st.markdown("**📐 Unfilled Fair Value Gaps**")
+                fvgs = structure_analysis.get('unfilled_fvgs', [])[-5:]
+                if fvgs:
+                    for fvg in reversed(fvgs):
+                        fvg_icon = "⬆️" if fvg.fvg_type == 'bullish' else "⬇️"
+                        fill_pct = fvg.fill_percentage * 100
+                        st.markdown(f"- {fvg_icon} {fvg.fvg_type.title()} FVG: ₹{fvg.bottom:.2f} - ₹{fvg.top:.2f} ({fill_pct:.0f}% filled)")
+                else:
+                    st.caption("No unfilled FVGs detected")
+    
+    # ============== TAB 3: MICROSTRUCTURE ==============
+    with tab_micro:
+        st.subheader("🔬 Microstructure Discovery")
+        st.caption("Order Flow, Volume Profile, Market Depth Analysis")
+        
+        # Microstructure Settings
+        with st.expander("⚙️ Microstructure Settings", expanded=False):
+            micro_col1, micro_col2 = st.columns(2)
+            with micro_col1:
+                volume_bins = st.slider("Volume Profile Bins", 20, 100, 50, help="Number of price levels")
+            with micro_col2:
+                depth_levels = st.slider("Depth Levels", 10, 50, 20, help="Order book depth")
+        
+        # Run Microstructure Analysis
+        with st.spinner("Analyzing microstructure..."):
+            try:
+                micro_analysis = analyze_microstructure(
+                    df,
+                    volume_bins=volume_bins,
+                    depth_levels=depth_levels
+                )
+            except Exception as e:
+                st.error(f"Microstructure analysis failed: {str(e)[:100]}")
+                micro_analysis = None
+        
+        if micro_analysis:
+            # Microstructure Score Gauge
+            score_col1, score_col2 = st.columns([1, 2])
+            
+            with score_col1:
+                try:
+                    gauge_fig = create_microstructure_gauge(micro_analysis['micro_score'])
+                    st.plotly_chart(gauge_fig, use_container_width=True)
+                except Exception as e:
+                    st.warning(f"Gauge failed: {str(e)[:50]}")
+            
+            with score_col2:
+                st.markdown("**📊 Microstructure Metrics**")
+                
+                summary = micro_analysis['summary']
+                m_col1, m_col2, m_col3 = st.columns(3)
+                
+                with m_col1:
+                    if summary.get('poc'):
+                        st.metric("Point of Control (POC)", f"₹{summary['poc']:,.2f}")
+                    else:
+                        st.metric("Point of Control (POC)", "N/A")
+                
+                with m_col2:
+                    if summary.get('vah') and summary.get('val'):
+                        st.metric("Value Area", f"₹{summary['val']:,.2f} - ₹{summary['vah']:,.2f}")
+                    else:
+                        st.metric("Value Area", "N/A")
+                
+                with m_col3:
+                    if summary.get('spread_pct'):
+                        st.metric("Bid-Ask Spread", f"{summary['spread_pct']:.3f}%")
+                    else:
+                        st.metric("Bid-Ask Spread", "N/A")
+                
+                # Score details
+                micro_score = micro_analysis['micro_score']
+                st.markdown(f"**Regime:** {micro_score.get('regime', 'Unknown')}")
+                st.markdown(f"**Delta Trend:** {micro_score.get('delta_trend', 'Unknown')}")
+                st.markdown(f"**Value Area Position:** {micro_score.get('value_area_position', 'Unknown')}")
+            
+            st.markdown("---")
+            
+            # Volume Profile Chart
+            st.markdown("### 📊 Volume Profile (VPVR)")
+            try:
+                vp_fig = create_volume_profile_chart(df, micro_analysis['volume_profile'], 'horizontal')
+                st.plotly_chart(vp_fig, use_container_width=True, config={
+                    'displayModeBar': True,
+                    'scrollZoom': True
+                })
+            except Exception as e:
+                st.error(f"Volume Profile chart failed: {str(e)[:100]}")
+            
+            st.markdown("---")
+            
+            # Market Depth Chart
+            col_depth, col_flow = st.columns(2)
+            
+            with col_depth:
+                st.markdown("### 📈 Market Depth (Simulated)")
+                try:
+                    depth_fig = create_depth_chart(micro_analysis['order_book'])
+                    st.plotly_chart(depth_fig, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Depth chart failed: {str(e)[:100]}")
+            
+            with col_flow:
+                st.markdown("### 💹 Order Book Stats")
+                order_book = micro_analysis['order_book']
+                
+                st.metric("Mid Price", f"₹{order_book.get('mid_price', 0):,.2f}")
+                st.metric("Best Bid", f"₹{order_book.get('best_bid', 0):,.2f}")
+                st.metric("Best Ask", f"₹{order_book.get('best_ask', 0):,.2f}")
+                
+                bid_liq = order_book.get('total_bid_liquidity', 0)
+                ask_liq = order_book.get('total_ask_liquidity', 0)
+                total_liq = bid_liq + ask_liq
+                
+                if total_liq > 0:
+                    bid_pct = bid_liq / total_liq * 100
+                    st.progress(bid_pct / 100)
+                    st.caption(f"Bid Liquidity: {bid_pct:.1f}% | Ask Liquidity: {100-bid_pct:.1f}%")
+            
+            st.markdown("---")
+            
+            # Order Flow Chart
+            st.markdown("### 📉 Order Flow Analysis")
+            order_imbalance = micro_analysis.get('order_imbalance')
+            if order_imbalance is not None and not order_imbalance.empty:
+                try:
+                    flow_fig = create_order_flow_chart(order_imbalance)
+                    st.plotly_chart(flow_fig, use_container_width=True, config={
+                        'displayModeBar': True,
+                        'scrollZoom': True
+                    })
+                except Exception as e:
+                    st.error(f"Order flow chart failed: {str(e)[:100]}")
+            else:
+                st.info("Insufficient data for order flow analysis")
+            
+            # Volume Profile Data Table
+            with st.expander("📋 Volume Profile Data"):
+                vp_df = get_volume_profile_df(micro_analysis['volume_profile'])
+                if not vp_df.empty:
+                    vp_df['Price'] = vp_df['Price'].apply(lambda x: f"₹{x:,.2f}")
+                    vp_df['Volume'] = vp_df['Volume'].apply(lambda x: f"{x:,.0f}")
+                    st.dataframe(vp_df, use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No volume profile data available")
 
 
 if __name__ == "__main__":
