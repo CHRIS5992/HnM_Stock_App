@@ -1124,8 +1124,38 @@ def main():
             
             with score_col1:
                 try:
+                    micro_score = micro_analysis['micro_score']
+                    overall_score = micro_score.get('overall_score', 0)
+                    regime = micro_score.get('regime', 'Unknown')
+                    
+                    # Regime color
+                    if 'Buy' in regime or 'Accumulation' in regime:
+                        rc = '#22c55e'
+                    elif 'Sell' in regime or 'Distribution' in regime:
+                        rc = '#ef4444'
+                    else:
+                        rc = '#9ca3af'
+                    
+                    # Regime label ABOVE gauge (rendered via Streamlit)
+                    st.markdown(
+                        f'<div style="text-align:center;padding:4px 0 0 0;">'
+                        f'<span style="font-size:18px;font-weight:700;color:{rc};">{regime}</span>'
+                        f'</div>',
+                        unsafe_allow_html=True
+                    )
+                    
+                    # Clean gauge (arc + needle only)
                     gauge_fig = create_microstructure_gauge(micro_analysis['micro_score'])
                     st.plotly_chart(gauge_fig, use_container_width=True)
+                    
+                    # Score BELOW gauge (rendered via Streamlit)
+                    st.markdown(
+                        f'<div style="text-align:center;margin-top:-16px;">'
+                        f'<span style="font-size:28px;font-weight:700;color:rgba(243,244,246,0.85);">{int(overall_score)}</span>'
+                        f'<br><span style="font-size:11px;color:#9ca3af;">Microstructure Score</span>'
+                        f'</div>',
+                        unsafe_allow_html=True
+                    )
                 except Exception as e:
                     st.warning(f"Gauge failed: {str(e)[:50]}")
             
@@ -1133,31 +1163,138 @@ def main():
                 st.markdown("**📊 Microstructure Metrics**")
                 
                 summary = micro_analysis['summary']
-                m_col1, m_col2, m_col3 = st.columns(3)
                 
-                with m_col1:
-                    if summary.get('poc'):
-                        st.metric("Point of Control (POC)", f"₹{summary['poc']:,.2f}")
-                    else:
-                        st.metric("Point of Control (POC)", "N/A")
+                # Custom styled metric cards with professional aesthetics
+                st.markdown("""
+                <style>
+                .metric-card {
+                    background: rgba(255, 255, 255, 0.03);
+                    border: 1px solid rgba(255, 255, 255, 0.08);
+                    border-radius: 8px;
+                    padding: 16px;
+                    margin-bottom: 12px;
+                }
+                .metric-label {
+                    color: rgb(156, 163, 175);
+                    font-size: 12px;
+                    font-weight: 500;
+                    text-transform: uppercase;
+                    letter-spacing: 0.5px;
+                    margin-bottom: 8px;
+                }
+                .metric-value {
+                    color: rgb(243, 244, 246);
+                    font-size: 20px;
+                    font-weight: 700;
+                    line-height: 1.2;
+                }
+                .metric-secondary {
+                    color: rgb(156, 163, 175);
+                    font-size: 14px;
+                    font-weight: 400;
+                    margin-left: 4px;
+                }
+                .metric-sub {
+                    color: rgb(209, 213, 219);
+                    font-size: 15px;
+                    font-weight: 600;
+                    line-height: 1.8;
+                }
+                .metric-row {
+                    display: grid;
+                    grid-template-columns: 1fr 1fr 1fr;
+                    gap: 12px;
+                    margin-top: 12px;
+                }
+                @media (max-width: 768px) {
+                    .metric-row {
+                        grid-template-columns: 1fr;
+                    }
+                }
+                </style>
+                """, unsafe_allow_html=True)
                 
-                with m_col2:
+                # POC, Value Area, and Spread cards
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    poc_value = f"₹{summary['poc']:,.2f}" if summary.get('poc') else "N/A"
+                    st.markdown(f"""
+                    <div class="metric-card">
+                        <div class="metric-label">Point of Control</div>
+                        <div class="metric-value">{poc_value}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with col2:
                     if summary.get('vah') and summary.get('val'):
-                        st.metric("Value Area", f"₹{summary['val']:,.2f} - ₹{summary['vah']:,.2f}")
+                        vah_str = f"₹{summary['vah']:,.2f}"
+                        val_str = f"₹{summary['val']:,.2f}"
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <div class="metric-label">Value Area</div>
+                            <div class="metric-sub">VAH: {vah_str}</div>
+                            <div class="metric-sub">VAL: {val_str}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
                     else:
-                        st.metric("Value Area", "N/A")
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <div class="metric-label">Value Area</div>
+                            <div class="metric-value">N/A</div>
+                        </div>
+                        """, unsafe_allow_html=True)
                 
-                with m_col3:
+                with col3:
                     if summary.get('spread_pct'):
-                        st.metric("Bid-Ask Spread", f"{summary['spread_pct']:.3f}%")
+                        # Calculate absolute spread (assuming current price available)
+                        spread_pct = summary['spread_pct']
+                        # If we have POC, use it as reference for absolute calculation
+                        if summary.get('poc'):
+                            spread_abs = summary['poc'] * (spread_pct / 100)
+                            spread_str = f"₹{spread_abs:.2f}"
+                        else:
+                            spread_str = "₹–"
+                        
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <div class="metric-label">Bid-Ask Spread</div>
+                            <div class="metric-value">{spread_str} <span class="metric-secondary">({spread_pct:.3f}%)</span></div>
+                        </div>
+                        """, unsafe_allow_html=True)
                     else:
-                        st.metric("Bid-Ask Spread", "N/A")
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <div class="metric-label">Bid-Ask Spread</div>
+                            <div class="metric-value">N/A</div>
+                        </div>
+                        """, unsafe_allow_html=True)
                 
-                # Score details
+                # Score details with styled info cards
+                st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
+                
                 micro_score = micro_analysis['micro_score']
-                st.markdown(f"**Regime:** {micro_score.get('regime', 'Unknown')}")
-                st.markdown(f"**Delta Trend:** {micro_score.get('delta_trend', 'Unknown')}")
-                st.markdown(f"**Value Area Position:** {micro_score.get('value_area_position', 'Unknown')}")
+                
+                detail_col1, detail_col2 = st.columns(2)
+                
+                with detail_col1:
+                    delta_trend = micro_score.get('delta_trend', 'Unknown')
+                    trend_color = 'rgb(34, 197, 94)' if 'Bullish' in delta_trend else 'rgb(239, 68, 68)' if 'Bearish' in delta_trend else 'rgb(156, 163, 175)'
+                    st.markdown(f"""
+                    <div class="metric-card">
+                        <div class="metric-label">Delta Trend</div>
+                        <div class="metric-value" style="color: {trend_color};">{delta_trend}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with detail_col2:
+                    va_position = micro_score.get('value_area_position', 'Unknown')
+                    st.markdown(f"""
+                    <div class="metric-card">
+                        <div class="metric-label">Value Area Position</div>
+                        <div class="metric-value">{va_position}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
             
             st.markdown("---")
             

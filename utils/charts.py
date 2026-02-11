@@ -613,53 +613,55 @@ def create_order_flow_chart(order_imbalance_df: pd.DataFrame) -> go.Figure:
 
 def create_microstructure_gauge(micro_score: dict) -> go.Figure:
     """
-    Create a gauge chart showing overall microstructure score.
-    
-    Args:
-        micro_score: Output from calculate_microstructure_score()
-        
-    Returns:
-        Plotly Figure with gauge visualization
+    Minimal gauge – arc + needle only, no text.
+    All labels (regime, score) are rendered by the caller via Streamlit.
     """
-    theme = INSTITUTIONAL_DARK_THEME
-    
     overall_score = micro_score.get('overall_score', 0)
     regime = micro_score.get('regime', 'Unknown')
-    
+
+    if 'Buy' in regime or 'Accumulation' in regime:
+        rc = 'rgb(34,197,94)'
+    elif 'Sell' in regime or 'Distribution' in regime:
+        rc = 'rgb(239,68,68)'
+    else:
+        rc = 'rgb(156,163,175)'
+
     fig = go.Figure(go.Indicator(
-        mode='gauge+number+delta',
+        mode='gauge',
         value=overall_score,
-        title=dict(
-            text=f"Microstructure Score<br><span style='font-size:0.8em;color:{theme['muted_text']}'>{regime}</span>",
-            font=dict(size=16)
-        ),
-        delta=dict(reference=0, increasing=dict(color=theme['bullish']), decreasing=dict(color=theme['bearish'])),
         gauge=dict(
-            axis=dict(range=[-100, 100], tickwidth=1, tickcolor=theme['text']),
-            bar=dict(color=theme['accent']),
-            bgcolor=theme['paper'],
-            borderwidth=2,
-            bordercolor=theme['grid'],
+            axis=dict(
+                range=[-100, 100],
+                tickwidth=1,
+                tickcolor='rgba(156,163,175,0.25)',
+                tickfont=dict(size=9, color='rgba(156,163,175,0.5)'),
+                dtick=50,
+            ),
+            bar=dict(color=rc, thickness=0.70),
+            bgcolor='rgba(255,255,255,0.02)',
+            borderwidth=0,
             steps=[
-                dict(range=[-100, -30], color='rgba(255, 107, 107, 0.3)'),
-                dict(range=[-30, -10], color='rgba(255, 193, 7, 0.2)'),
-                dict(range=[-10, 10], color='rgba(128, 128, 128, 0.2)'),
-                dict(range=[10, 30], color='rgba(144, 238, 144, 0.2)'),
-                dict(range=[30, 100], color='rgba(0, 210, 106, 0.3)')
+                dict(range=[-100, -30], color='rgba(239,68,68,0.10)'),
+                dict(range=[-30,  -10], color='rgba(251,146,60,0.08)'),
+                dict(range=[-10,   10], color='rgba(156,163,175,0.08)'),
+                dict(range=[ 10,   30], color='rgba(52,211,153,0.08)'),
+                dict(range=[ 30,  100], color='rgba(34,197,94,0.10)'),
             ],
             threshold=dict(
-                line=dict(color=theme['neutral'], width=4),
-                thickness=0.75,
-                value=overall_score
-            )
-        )
+                line=dict(color=rc, width=4),
+                thickness=0.85,
+                value=overall_score,
+            ),
+        ),
     ))
-    
+
     fig.update_layout(
-        height=250,
-        margin=dict(l=20, r=20, t=50, b=20)
+        height=220,
+        margin=dict(l=70, r=70, t=10, b=30),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
     )
-    
+
     apply_dark_theme(fig)
     return fig
 
